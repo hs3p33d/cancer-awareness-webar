@@ -115,6 +115,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
       const stream = await startCamera({ facingMode });
       streamRef.current = stream;
 
+      // Video element is PERMANENTLY mounted in the DOM, so videoRef.current is never null!
       const video = videoRef.current;
       if (video) {
         await setupVideoElement(video, stream);
@@ -126,7 +127,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
       trackEvent('camera_started');
       trackEvent('camera_permission_granted');
 
-      // 2. Load face tracking model asynchronously in background (won't stall camera)
+      // 2. Load face tracking model asynchronously in background
       loadMediaPipe();
     } catch (err) {
       const cameraError = getCameraError(err);
@@ -135,6 +136,20 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
       trackEvent('camera_permission_denied');
     }
   }, [facingMode, loadMediaPipe]);
+
+  // Ensure stream stays attached if state shifts
+  useEffect(() => {
+    const video = videoRef.current;
+    const stream = streamRef.current;
+    if (video && stream && video.srcObject !== stream && (state === 'active' || state === 'effect-active')) {
+      setupVideoElement(video, stream)
+        .then(() => {
+          setVideoResolution(`${video.videoWidth}x${video.videoHeight}`);
+          setVideoReadyState(video.readyState);
+        })
+        .catch((e) => console.warn('Stream re-attach warning:', e));
+    }
+  }, [state]);
 
   // Animation loop with face detection, luminance check, and effect rendering
   useEffect(() => {
@@ -368,185 +383,17 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
     navigate('/');
   };
 
-  // ── 1. Permission Screen ──────────────────────────────────
-  if (state === 'permission') {
-    return (
-      <main
-        className="flex flex-col items-center justify-center min-h-dvh px-6 text-center"
-        style={{
-          paddingTop: 'max(2rem, env(safe-area-inset-top))',
-          paddingBottom: 'max(2rem, env(safe-area-inset-bottom))',
-        }}
-      >
-        <div className="animate-fade-in-up max-w-sm w-full">
-          <div
-            className="w-20 h-20 mx-auto mb-6 rounded-full flex items-center justify-center"
-            style={{ background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}
-          >
-            <span className="text-3xl" aria-hidden="true">📸</span>
-          </div>
+  const isDenied = error === 'permission_denied';
 
-          <h1 className="text-2xl sm:text-3xl font-bold mb-3">{content.cameraPermission.title}</h1>
-          <p className="text-sm mb-3" style={{ color: 'var(--fg-secondary)' }}>
-            {content.cameraPermission.description}
-          </p>
-          <p className="text-xs mb-6 leading-relaxed" style={{ color: 'var(--fg-muted)' }}>
-            {content.cameraPermission.privacyAssurance}
-          </p>
-
-          {/* In-app browser detection advice */}
-          {isAppBrowser && (
-            <div
-              className="glass-card p-4 mb-6 text-left"
-              style={{
-                background: 'rgba(251, 191, 36, 0.08)',
-                border: '1px solid rgba(251, 191, 36, 0.25)',
-              }}
-            >
-              <div className="flex items-center gap-2 mb-2 font-semibold text-xs" style={{ color: 'var(--warning)' }}>
-                <span>⚠️</span>
-                <span>{appBrowserName || 'In-App'} Browser Detected</span>
-              </div>
-              <p className="text-xs mb-3 leading-relaxed" style={{ color: 'var(--fg-secondary)' }}>
-                {content.cameraPermission.inAppNotice.message}
-              </p>
-              <button
-                onClick={handleCopyLink}
-                className="btn-secondary w-full text-xs py-2"
-              >
-                {copiedLink ? '✓ Copied!' : content.cameraPermission.inAppNotice.copyLinkCta}
-              </button>
-            </div>
-          )}
-
-          <button
-            onClick={handleEnableCamera}
-            className="btn-primary w-full mb-3 py-4 text-sm"
-            id="enable-camera-btn"
-          >
-            {content.cameraPermission.cta}
-          </button>
-
-          <button
-            onClick={() => navigate('/awareness')}
-            className="btn-secondary w-full py-3 text-xs mb-4"
-            id="skip-camera-btn"
-          >
-            {content.cameraPermission.continueWithoutCamera}
-          </button>
-
-          <Link
-            to="/camera-test"
-            className="text-[11px] text-neutral-400 hover:text-neutral-200 underline block"
-          >
-            🛠️ Hardware Camera Diagnostic Test (/camera-test)
-          </Link>
-        </div>
-      </main>
-    );
-  }
-
-  // ── 2. Loading Screen ─────────────────────────────────────
-  if (state === 'loading') {
-    return (
-      <main className="flex flex-col items-center justify-center min-h-dvh px-6 text-center">
-        <div className="animate-fade-in">
-          <div
-            className="w-16 h-16 mx-auto mb-6 rounded-full animate-pulse-glow flex items-center justify-center"
-            style={{ background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}
-          >
-            <div
-              className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin"
-              style={{ borderColor: 'var(--primary)', borderTopColor: 'transparent' }}
-            />
-          </div>
-          <p className="text-sm font-medium" style={{ color: 'var(--fg-secondary)' }}>
-            Starting camera feed...
-          </p>
-        </div>
-      </main>
-    );
-  }
-
-  // ── 3. Error / Denied Screen ──────────────────────────────
-  if (state === 'error') {
-    const isDenied = error === 'permission_denied';
-    return (
-      <main
-        className="flex flex-col items-center justify-center min-h-dvh px-6 text-center"
-        style={{
-          paddingTop: 'max(2rem, env(safe-area-inset-top))',
-          paddingBottom: 'max(2rem, env(safe-area-inset-bottom))',
-        }}
-      >
-        <div className="animate-fade-in-up max-w-sm w-full">
-          <div
-            className="w-20 h-20 mx-auto mb-6 rounded-full flex items-center justify-center"
-            style={{
-              background: 'rgba(248, 113, 113, 0.1)',
-              border: '1px solid rgba(248, 113, 113, 0.25)',
-            }}
-          >
-            <span className="text-3xl" aria-hidden="true">{isDenied ? '🔒' : '⚠️'}</span>
-          </div>
-
-          <h2 className="text-2xl font-bold mb-3">
-            {isDenied ? content.cameraPermission.deniedTitle : 'Camera Unavailable'}
-          </h2>
-          <p className="text-sm mb-6" style={{ color: 'var(--fg-secondary)' }}>
-            {isDenied
-              ? content.cameraPermission.deniedDescription
-              : 'We could not access your camera. You can explore the cancer awareness and prevention guide directly or run the diagnostic test.'}
-          </p>
-
-          {isDenied && (
-            <ol
-              className="text-left mb-8 space-y-2 text-xs p-4 rounded-lg"
-              style={{ background: 'var(--card-bg)', color: 'var(--fg-muted)' }}
-            >
-              {content.cameraPermission.deniedInstructions.map((step, i) => (
-                <li key={i} className="flex gap-2">
-                  <span className="font-bold" style={{ color: 'var(--primary)' }}>{i + 1}.</span>
-                  <span>{step}</span>
-                </li>
-              ))}
-            </ol>
-          )}
-
-          <button
-            onClick={() => navigate('/awareness')}
-            className="btn-primary w-full mb-3"
-            id="continue-without-cam-error-btn"
-          >
-            {content.cameraPermission.continueWithoutCamera}
-          </button>
-
-          <Link
-            to="/camera-test"
-            className="btn-secondary w-full text-xs py-2 mb-2 block"
-          >
-            Open Camera Diagnostic Tool (/camera-test)
-          </Link>
-
-          <button onClick={handleClose} className="text-xs text-neutral-400 hover:text-white py-2">
-            Back to Home
-          </button>
-        </div>
-      </main>
-    );
-  }
-
-  // ── 4. Camera HUD & Effect Experience ─────────────────────
   return (
     <main
-      className="relative w-full h-dvh overflow-hidden select-none"
+      className="relative w-full h-dvh overflow-hidden select-none bg-black"
       style={{
-        background: '#000',
         paddingTop: 'env(safe-area-inset-top)',
         paddingBottom: 'env(safe-area-inset-bottom)',
       }}
     >
-      {/* 1. Underlying raw hardware video - GUARANTEES live reflection on mobile */}
+      {/* ── PERMANENT VIDEO & CANVAS ELEMENTS (Never unmounted) ── */}
       <video
         ref={videoRef}
         playsInline
@@ -557,7 +404,6 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
         aria-hidden="true"
       />
 
-      {/* 2. AR transformation overlay canvas */}
       <canvas
         ref={canvasRef}
         className="absolute inset-0 w-full h-full object-cover pointer-events-none"
@@ -566,7 +412,167 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
         }}
       />
 
-      {/* TOP HEADER HUD */}
+      {/* ── 1. PERMISSION OVERLAY ── */}
+      {state === 'permission' && (
+        <div
+          className="absolute inset-0 z-40 flex flex-col items-center justify-center px-6 text-center bg-black/90 backdrop-blur-md"
+          style={{
+            paddingTop: 'max(2rem, env(safe-area-inset-top))',
+            paddingBottom: 'max(2rem, env(safe-area-inset-bottom))',
+          }}
+        >
+          <div className="animate-fade-in-up max-w-sm w-full">
+            <div
+              className="w-20 h-20 mx-auto mb-6 rounded-full flex items-center justify-center"
+              style={{ background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}
+            >
+              <span className="text-3xl" aria-hidden="true">📸</span>
+            </div>
+
+            <h1 className="text-2xl sm:text-3xl font-bold mb-3">{content.cameraPermission.title}</h1>
+            <p className="text-sm mb-3" style={{ color: 'var(--fg-secondary)' }}>
+              {content.cameraPermission.description}
+            </p>
+            <p className="text-xs mb-6 leading-relaxed" style={{ color: 'var(--fg-muted)' }}>
+              {content.cameraPermission.privacyAssurance}
+            </p>
+
+            {isAppBrowser && (
+              <div
+                className="glass-card p-4 mb-6 text-left"
+                style={{
+                  background: 'rgba(251, 191, 36, 0.08)',
+                  border: '1px solid rgba(251, 191, 36, 0.25)',
+                }}
+              >
+                <div className="flex items-center gap-2 mb-2 font-semibold text-xs" style={{ color: 'var(--warning)' }}>
+                  <span>⚠️</span>
+                  <span>{appBrowserName || 'In-App'} Browser Detected</span>
+                </div>
+                <p className="text-xs mb-3 leading-relaxed" style={{ color: 'var(--fg-secondary)' }}>
+                  {content.cameraPermission.inAppNotice.message}
+                </p>
+                <button
+                  onClick={handleCopyLink}
+                  className="btn-secondary w-full text-xs py-2"
+                >
+                  {copiedLink ? '✓ Copied!' : content.cameraPermission.inAppNotice.copyLinkCta}
+                </button>
+              </div>
+            )}
+
+            <button
+              onClick={handleEnableCamera}
+              className="btn-primary w-full mb-3 py-4 text-sm font-bold"
+              id="enable-camera-btn"
+            >
+              {content.cameraPermission.cta}
+            </button>
+
+            <button
+              onClick={() => navigate('/awareness')}
+              className="btn-secondary w-full py-3 text-xs mb-4"
+              id="skip-camera-btn"
+            >
+              {content.cameraPermission.continueWithoutCamera}
+            </button>
+
+            <Link
+              to="/camera-test"
+              className="text-[11px] text-neutral-400 hover:text-neutral-200 underline block"
+            >
+              🛠️ Hardware Camera Diagnostic Test (/camera-test)
+            </Link>
+          </div>
+        </div>
+      )}
+
+      {/* ── 2. LOADING OVERLAY ── */}
+      {state === 'loading' && (
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center px-6 text-center bg-black/80 backdrop-blur-sm">
+          <div className="animate-fade-in">
+            <div
+              className="w-16 h-16 mx-auto mb-6 rounded-full animate-pulse-glow flex items-center justify-center"
+              style={{ background: 'var(--glass-bg)', border: '1px solid var(--glass-border)' }}
+            >
+              <div
+                className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin"
+                style={{ borderColor: 'var(--primary)', borderTopColor: 'transparent' }}
+              />
+            </div>
+            <p className="text-sm font-medium" style={{ color: 'var(--fg-secondary)' }}>
+              Activating camera feed...
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── 3. ERROR OVERLAY ── */}
+      {state === 'error' && (
+        <div
+          className="absolute inset-0 z-40 flex flex-col items-center justify-center px-6 text-center bg-black/90 backdrop-blur-md"
+          style={{
+            paddingTop: 'max(2rem, env(safe-area-inset-top))',
+            paddingBottom: 'max(2rem, env(safe-area-inset-bottom))',
+          }}
+        >
+          <div className="animate-fade-in-up max-w-sm w-full">
+            <div
+              className="w-20 h-20 mx-auto mb-6 rounded-full flex items-center justify-center"
+              style={{
+                background: 'rgba(248, 113, 113, 0.1)',
+                border: '1px solid rgba(248, 113, 113, 0.25)',
+              }}
+            >
+              <span className="text-3xl" aria-hidden="true">{isDenied ? '🔒' : '⚠️'}</span>
+            </div>
+
+            <h2 className="text-2xl font-bold mb-3">
+              {isDenied ? content.cameraPermission.deniedTitle : 'Camera Unavailable'}
+            </h2>
+            <p className="text-sm mb-6" style={{ color: 'var(--fg-secondary)' }}>
+              {isDenied
+                ? content.cameraPermission.deniedDescription
+                : 'We could not access your camera. You can explore the cancer awareness and prevention guide directly.'}
+            </p>
+
+            {isDenied && (
+              <ol
+                className="text-left mb-8 space-y-2 text-xs p-4 rounded-lg"
+                style={{ background: 'var(--card-bg)', color: 'var(--fg-muted)' }}
+              >
+                {content.cameraPermission.deniedInstructions.map((step, i) => (
+                  <li key={i} className="flex gap-2">
+                    <span className="font-bold" style={{ color: 'var(--primary)' }}>{i + 1}.</span>
+                    <span>{step}</span>
+                  </li>
+                ))}
+              </ol>
+            )}
+
+            <button
+              onClick={() => navigate('/awareness')}
+              className="btn-primary w-full mb-3"
+              id="continue-without-cam-error-btn"
+            >
+              {content.cameraPermission.continueWithoutCamera}
+            </button>
+
+            <Link
+              to="/camera-test"
+              className="btn-secondary w-full text-xs py-2 mb-2 block"
+            >
+              Open Camera Diagnostic Tool (/camera-test)
+            </Link>
+
+            <button onClick={handleClose} className="text-xs text-neutral-400 hover:text-white py-2">
+              Back to Home
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── 4. CAMERA HEADER HUD ── */}
       <header
         className="absolute top-0 left-0 right-0 z-20 px-4 pt-3 pb-2 flex items-center justify-between"
         style={{
@@ -598,7 +604,6 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Simulation tag */}
           {(state === 'effect-active' || introStep >= 2) && (
             <div
               className="px-2.5 py-1 rounded-full text-[10px] font-bold tracking-wider animate-fade-in"
@@ -613,7 +618,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
             </div>
           )}
 
-          {hasMultiCam && state === 'active' && (
+          {hasMultiCam && (state === 'active' || state === 'effect-active') && (
             <button
               onClick={handleSwitchCamera}
               className="w-10 h-10 rounded-full flex items-center justify-center transition-opacity hover:opacity-80"
@@ -626,7 +631,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
         </div>
       </header>
 
-      {/* DIAGNOSTIC OVERLAY (PART 6) */}
+      {/* DIAGNOSTIC OVERLAY */}
       {showDiagnostics && (
         <div
           className="absolute top-16 left-4 z-30 font-mono text-[11px] p-2.5 rounded bg-black/80 border border-neutral-700 text-neutral-200 pointer-events-none space-y-0.5 shadow-xl max-w-xs"
@@ -646,7 +651,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
         </div>
       )}
 
-      {/* MEDIAPIPE STATUS BANNER (If model is still loading or failed) */}
+      {/* MEDIAPIPE STATUS BANNER */}
       {mediaPipeStatus === 'LOADING' && state === 'active' && (
         <div className="absolute top-16 left-0 right-0 z-20 flex justify-center px-4">
           <div className="px-3 py-1 rounded-full text-xs font-medium bg-neutral-900/80 border border-neutral-700 text-neutral-300 backdrop-blur-md animate-pulse">
@@ -672,7 +677,6 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
       {/* HUD GUIDANCE / STATUS */}
       {state === 'active' && (
         <div className="absolute top-16 left-0 right-0 z-20 flex flex-col items-center gap-2 px-4 pointer-events-none">
-          {/* Low light warning */}
           {isLowLight && (
             <div
               className="px-4 py-2 rounded-full text-xs font-semibold text-center animate-fade-in shadow-lg"
@@ -686,7 +690,6 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
             </div>
           )}
 
-          {/* Face count status */}
           <div
             className="px-4 py-1.5 rounded-full text-xs font-medium animate-fade-in shadow-md"
             style={{
@@ -774,7 +777,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
         </div>
       )}
 
-      {/* START EFFECT BUTTON (Enabled when exactly 1 face is aligned) */}
+      {/* START EFFECT BUTTON */}
       {state === 'active' && faceDetected && faceCount === 1 && (
         <div
           className="absolute bottom-8 left-0 right-0 z-20 flex justify-center px-6"

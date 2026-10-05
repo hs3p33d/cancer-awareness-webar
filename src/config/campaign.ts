@@ -8,7 +8,9 @@ export const campaign = {
   tagline: 'A Cancer Awareness Experience',
   description:
     'An interactive awareness experience that helps you see cancer differently — and inspires one meaningful change.',
-  campaignUrl: import.meta.env.VITE_CAMPAIGN_URL || 'https://yourcampaign.pages.dev',
+  campaignUrl:
+    import.meta.env.VITE_CAMPAIGN_URL ||
+    'https://cancer-awareness-webar.deepesh-gandhi28.workers.dev',
   organizationName: 'Cancer Awareness Campaign',
   hashtags: ['#CancerAwareness', '#SeeYourselfDifferently', '#EarlyDetection', '#Prevention'],
   socialHandle: '',
