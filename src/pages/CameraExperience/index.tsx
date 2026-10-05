@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import { content } from '../../config/content';
 import { campaign } from '../../config/campaign';
 import {
   startCamera,
   stopCamera,
+  setupVideoElement,
   hasMultipleCameras,
   getCameraError,
   type CameraError,
@@ -42,15 +43,27 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
   const effectEngineRef = useRef<EffectEngine>(new EffectEngine());
   const lastTimestampRef = useRef<number>(0);
   const noFaceTimerRef = useRef<number>(0);
+  const lumCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Diagnostic tracking refs
+  const frameCountRef = useRef<number>(0);
+  const lastFpsUpdateRef = useRef<number>(0);
 
   const [state, setState] = useState<CameraState>('permission');
   const [error, setError] = useState<CameraError | null>(null);
   const [faceDetected, setFaceDetected] = useState(false);
   const [faceCount, setFaceCount] = useState(0);
+  const [landmarkCount, setLandmarkCount] = useState(0);
+  const [fps, setFps] = useState(0);
+  const [videoResolution, setVideoResolution] = useState('0x0');
+  const [videoReadyState, setVideoReadyState] = useState(0);
+  const [mediaPipeStatus, setMediaPipeStatus] = useState<'READY' | 'LOADING' | 'ERROR'>('LOADING');
+  const [mediaPipeError, setMediaPipeError] = useState<string | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+
   const [isLowLight, setIsLowLight] = useState(false);
   const [hasMultiCam, setHasMultiCam] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
-  const [modelLoading, setModelLoading] = useState(false);
   const [effectProgress, setEffectProgress] = useState(0);
   const [introStep, setIntroStep] = useState(0);
   const [copiedLink, setCopiedLink] = useState(false);
@@ -74,37 +87,54 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
     hasMultipleCameras().then(setHasMultiCam);
   }, []);
 
+  // Initialize MediaPipe model
+  const loadMediaPipe = useCallback(async () => {
+    if (isFaceTrackingReady()) {
+      setMediaPipeStatus('READY');
+      return;
+    }
+    setMediaPipeStatus('LOADING');
+    setMediaPipeError(null);
+    try {
+      await initFaceTracking();
+      setMediaPipeStatus('READY');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('MediaPipe initialization failed:', err);
+      setMediaPipeStatus('ERROR');
+      setMediaPipeError(msg);
+    }
+  }, []);
+
   // Start camera
   const handleEnableCamera = useCallback(async () => {
     setState('loading');
-    setModelLoading(true);
 
     try {
-      // Start camera stream and load MediaPipe face tracking
-      const [stream] = await Promise.all([
-        startCamera({ facingMode }),
-        initFaceTracking(),
-      ]);
-
+      // 1. Immediately request camera stream with mobile fallbacks
+      const stream = await startCamera({ facingMode });
       streamRef.current = stream;
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+      const video = videoRef.current;
+      if (video) {
+        await setupVideoElement(video, stream);
+        setVideoResolution(`${video.videoWidth}x${video.videoHeight}`);
+        setVideoReadyState(video.readyState);
       }
 
-      setModelLoading(false);
       setState('active');
       trackEvent('camera_started');
       trackEvent('camera_permission_granted');
+
+      // 2. Load face tracking model asynchronously in background (won't stall camera)
+      loadMediaPipe();
     } catch (err) {
       const cameraError = getCameraError(err);
       setError(cameraError);
       setState('error');
-      setModelLoading(false);
       trackEvent('camera_permission_denied');
     }
-  }, [facingMode]);
+  }, [facingMode, loadMediaPipe]);
 
   // Animation loop with face detection, luminance check, and effect rendering
   useEffect(() => {
@@ -122,60 +152,66 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
     const loop = () => {
       if (!running) return;
 
-      if (video.readyState >= 2) {
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        // Draw mirrored camera video for user-facing camera
-        ctx.save();
-        if (facingMode === 'user') {
-          ctx.translate(canvas.width, 0);
-          ctx.scale(-1, 1);
+      if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          setVideoResolution(`${video.videoWidth}x${video.videoHeight}`);
         }
-        ctx.drawImage(video, 0, 0);
-        ctx.restore();
+
+        setVideoReadyState(video.readyState);
 
         const now = performance.now();
+
+        // Calculate real-time FPS
+        frameCountRef.current++;
+        if (now - lastFpsUpdateRef.current >= 1000) {
+          setFps(Math.round((frameCountRef.current * 1000) / (now - lastFpsUpdateRef.current)));
+          frameCountRef.current = 0;
+          lastFpsUpdateRef.current = now;
+        }
 
         // 30fps detection interval
         if (now - lastTimestampRef.current > 33) {
           lastTimestampRef.current = now;
 
-          // Estimate frame brightness in center of frame
+          // Fast 16x16 video luminance check for low-light warning
           try {
-            const centerX = Math.round(canvas.width / 2);
-            const centerY = Math.round(canvas.height / 2);
-            const sampleData = ctx.getImageData(
-              Math.max(0, centerX - 25),
-              Math.max(0, centerY - 25),
-              50,
-              50
-            ).data;
-
-            let totalLum = 0;
-            for (let i = 0; i < sampleData.length; i += 4) {
-              totalLum += (sampleData[i] * 299 + sampleData[i + 1] * 587 + sampleData[i + 2] * 114) / 1000;
+            if (!lumCanvasRef.current) {
+              lumCanvasRef.current = document.createElement('canvas');
+              lumCanvasRef.current.width = 16;
+              lumCanvasRef.current.height = 16;
             }
-            const avgLum = totalLum / (sampleData.length / 4);
-
-            if (avgLum < 32) {
-              if (!noFaceTimerRef.current) {
-                noFaceTimerRef.current = now;
-              } else if (now - noFaceTimerRef.current > 2000) {
-                setIsLowLight(true);
+            const lumCtx = lumCanvasRef.current.getContext('2d');
+            if (lumCtx) {
+              lumCtx.drawImage(video, 0, 0, 16, 16);
+              const data = lumCtx.getImageData(0, 0, 16, 16).data;
+              let totalLum = 0;
+              for (let i = 0; i < data.length; i += 4) {
+                totalLum += (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
               }
-            } else {
-              noFaceTimerRef.current = 0;
-              setIsLowLight(false);
+              const avgLum = totalLum / 256;
+              if (avgLum < 28) {
+                if (!noFaceTimerRef.current) {
+                  noFaceTimerRef.current = now;
+                } else if (now - noFaceTimerRef.current > 2000) {
+                  setIsLowLight(true);
+                }
+              } else {
+                noFaceTimerRef.current = 0;
+                setIsLowLight(false);
+              }
             }
           } catch {
-            // Ignore sampling errors
+            // Ignore luminance sampling errors
           }
 
           if (isFaceTrackingReady()) {
             const result = detectFaces(video, now);
             setFaceDetected(result.detected);
             setFaceCount(result.faceCount);
+            const numLandmarks = result.landmarks?.faceLandmarks?.[0]?.length ?? 0;
+            setLandmarkCount(numLandmarks);
 
             // Apply effect ONLY when exactly one face is detected
             if (
@@ -184,13 +220,19 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
               result.detected &&
               result.faceCount === 1
             ) {
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              // Draw video to canvas first before applying the bald transformation
               ctx.save();
               if (facingMode === 'user') {
                 ctx.translate(canvas.width, 0);
                 ctx.scale(-1, 1);
               }
+              ctx.drawImage(video, 0, 0);
               effectEngineRef.current.render(ctx, video, result.landmarks, now);
               ctx.restore();
+            } else if (state === 'active') {
+              // Canvas is clear so underlying video is shown with 0 overhead
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
             }
           }
         }
@@ -244,16 +286,38 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
     return () => clearInterval(interval);
   }, [state, reducedMotion]);
 
-  // Take photo
+  // Take photo composite
   const handleCapture = useCallback(() => {
+    const video = videoRef.current;
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!video) return;
 
-    const dataUrl = captureCanvas(canvas);
+    // Create an offscreen composite canvas with full resolution
+    const compositeCanvas = document.createElement('canvas');
+    compositeCanvas.width = video.videoWidth || 1280;
+    compositeCanvas.height = video.videoHeight || 720;
+    const compCtx = compositeCanvas.getContext('2d');
+    if (compCtx) {
+      if (state === 'effect-active' && canvas) {
+        // Effect canvas already has composite video + transformation
+        compCtx.drawImage(canvas, 0, 0, compositeCanvas.width, compositeCanvas.height);
+      } else {
+        // Draw raw video mirrored for user camera
+        compCtx.save();
+        if (facingMode === 'user') {
+          compCtx.translate(compositeCanvas.width, 0);
+          compCtx.scale(-1, 1);
+        }
+        compCtx.drawImage(video, 0, 0, compositeCanvas.width, compositeCanvas.height);
+        compCtx.restore();
+      }
+    }
+
+    const dataUrl = captureCanvas(compositeCanvas);
     onCapture(dataUrl);
     trackEvent('photo_taken');
     setState('capture');
-  }, [onCapture]);
+  }, [facingMode, state, onCapture]);
 
   // Switch camera
   const handleSwitchCamera = useCallback(async () => {
@@ -265,8 +329,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
       const stream = await startCamera({ facingMode: newMode });
       streamRef.current = stream;
       if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
+        await setupVideoElement(videoRef.current, stream);
       }
     } catch (err) {
       setError(getCameraError(err));
@@ -327,7 +390,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
           <p className="text-sm mb-3" style={{ color: 'var(--fg-secondary)' }}>
             {content.cameraPermission.description}
           </p>
-          <p className="text-xs mb-8 leading-relaxed" style={{ color: 'var(--fg-muted)' }}>
+          <p className="text-xs mb-6 leading-relaxed" style={{ color: 'var(--fg-muted)' }}>
             {content.cameraPermission.privacyAssurance}
           </p>
 
@@ -366,11 +429,18 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
 
           <button
             onClick={() => navigate('/awareness')}
-            className="btn-secondary w-full py-3 text-xs"
+            className="btn-secondary w-full py-3 text-xs mb-4"
             id="skip-camera-btn"
           >
             {content.cameraPermission.continueWithoutCamera}
           </button>
+
+          <Link
+            to="/camera-test"
+            className="text-[11px] text-neutral-400 hover:text-neutral-200 underline block"
+          >
+            🛠️ Hardware Camera Diagnostic Test (/camera-test)
+          </Link>
         </div>
       </main>
     );
@@ -391,7 +461,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
             />
           </div>
           <p className="text-sm font-medium" style={{ color: 'var(--fg-secondary)' }}>
-            {modelLoading ? 'Preparing awareness experience...' : 'Starting camera...'}
+            Starting camera feed...
           </p>
         </div>
       </main>
@@ -426,7 +496,7 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
           <p className="text-sm mb-6" style={{ color: 'var(--fg-secondary)' }}>
             {isDenied
               ? content.cameraPermission.deniedDescription
-              : 'We could not access your camera. You can explore the cancer awareness and prevention guide directly.'}
+              : 'We could not access your camera. You can explore the cancer awareness and prevention guide directly or run the diagnostic test.'}
           </p>
 
           {isDenied && (
@@ -451,7 +521,14 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
             {content.cameraPermission.continueWithoutCamera}
           </button>
 
-          <button onClick={handleClose} className="btn-secondary w-full text-xs">
+          <Link
+            to="/camera-test"
+            className="btn-secondary w-full text-xs py-2 mb-2 block"
+          >
+            Open Camera Diagnostic Tool (/camera-test)
+          </Link>
+
+          <button onClick={handleClose} className="text-xs text-neutral-400 hover:text-white py-2">
             Back to Home
           </button>
         </div>
@@ -469,20 +546,24 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
         paddingBottom: 'env(safe-area-inset-bottom)',
       }}
     >
-      {/* Hidden local video element */}
+      {/* 1. Underlying raw hardware video - GUARANTEES live reflection on mobile */}
       <video
         ref={videoRef}
-        className="absolute opacity-0 pointer-events-none"
         playsInline
         muted
         autoPlay
+        className="absolute inset-0 w-full h-full object-cover"
+        style={{ transform: facingMode === 'user' ? 'scaleX(-1)' : 'none' }}
         aria-hidden="true"
       />
 
-      {/* Main rendering canvas with local camera frame & effect */}
+      {/* 2. AR transformation overlay canvas */}
       <canvas
         ref={canvasRef}
-        className="absolute inset-0 w-full h-full object-cover"
+        className="absolute inset-0 w-full h-full object-cover pointer-events-none"
+        style={{
+          opacity: state === 'effect-active' ? 1 : 0,
+        }}
       />
 
       {/* TOP HEADER HUD */}
@@ -503,9 +584,18 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
           <span className="text-white text-base">✕</span>
         </button>
 
-        <span className="text-xs font-bold tracking-widest uppercase text-white/90">
-          {content.camera.title}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-bold tracking-widest uppercase text-white/90">
+            {content.camera.title}
+          </span>
+          <button
+            onClick={() => setShowDiagnostics((prev) => !prev)}
+            className="text-[10px] px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-neutral-300 font-mono transition"
+            title="Toggle Debug Overlay"
+          >
+            {showDiagnostics ? 'Hide HUD' : 'HUD'}
+          </button>
+        </div>
 
         <div className="flex items-center gap-2">
           {/* Simulation tag */}
@@ -536,9 +626,52 @@ export function CameraExperience({ onCapture }: CameraExperienceProps) {
         </div>
       </header>
 
+      {/* DIAGNOSTIC OVERLAY (PART 6) */}
+      {showDiagnostics && (
+        <div
+          className="absolute top-16 left-4 z-30 font-mono text-[11px] p-2.5 rounded bg-black/80 border border-neutral-700 text-neutral-200 pointer-events-none space-y-0.5 shadow-xl max-w-xs"
+        >
+          <div className="text-emerald-400 font-bold">Camera: OK (Stream Active)</div>
+          <div>Video: {videoReadyState >= 2 ? 'OK' : `ReadyState ${videoReadyState}`}</div>
+          <div>Video resolution: {videoResolution}</div>
+          <div>Face tracking: {faceDetected ? 'DETECTED' : 'SEARCHING'} ({faceCount} {faceCount === 1 ? 'face' : 'faces'})</div>
+          <div>Landmarks: {landmarkCount}</div>
+          <div>FPS: {fps}</div>
+          <div className={mediaPipeStatus === 'READY' ? 'text-emerald-400' : mediaPipeStatus === 'LOADING' ? 'text-yellow-400' : 'text-rose-400'}>
+            MediaPipe: {mediaPipeStatus}
+          </div>
+          {mediaPipeError && (
+            <div className="text-[10px] text-rose-300 mt-1 leading-tight">Error: {mediaPipeError}</div>
+          )}
+        </div>
+      )}
+
+      {/* MEDIAPIPE STATUS BANNER (If model is still loading or failed) */}
+      {mediaPipeStatus === 'LOADING' && state === 'active' && (
+        <div className="absolute top-16 left-0 right-0 z-20 flex justify-center px-4">
+          <div className="px-3 py-1 rounded-full text-xs font-medium bg-neutral-900/80 border border-neutral-700 text-neutral-300 backdrop-blur-md animate-pulse">
+            ⏳ Loading Face Tracking AI...
+          </div>
+        </div>
+      )}
+
+      {mediaPipeStatus === 'ERROR' && state === 'active' && (
+        <div className="absolute top-16 left-4 right-4 z-20 p-3 rounded bg-rose-950/90 border border-rose-600 text-rose-200 text-xs flex items-center justify-between shadow-lg">
+          <div>
+            <strong>AI Model Error:</strong> Face filter unavailable on this connection.
+          </div>
+          <button
+            onClick={loadMediaPipe}
+            className="px-2 py-1 rounded bg-rose-800 hover:bg-rose-700 text-[10px] font-bold"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* HUD GUIDANCE / STATUS */}
       {state === 'active' && (
-        <div className="absolute top-16 left-0 right-0 z-20 flex flex-col items-center gap-2 px-4">
+        <div className="absolute top-16 left-0 right-0 z-20 flex flex-col items-center gap-2 px-4 pointer-events-none">
           {/* Low light warning */}
           {isLowLight && (
             <div

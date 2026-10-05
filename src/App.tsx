@@ -9,7 +9,9 @@ import { NotSupportedPage } from './pages/NotSupportedPage';
 import { initializeAnalytics, trackEvent } from './services/analytics';
 import { useEffect } from 'react';
 
-export type AppScreen = 'landing' | 'camera' | 'awareness' | 'privacy' | 'qr' | 'not-supported';
+import { CameraTestPage } from './pages/CameraTestPage';
+
+export type AppScreen = 'landing' | 'camera' | 'awareness' | 'privacy' | 'qr' | 'not-supported' | 'camera-test';
 
 function App() {
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
@@ -38,6 +40,7 @@ function App() {
         <Route path="/privacy" element={<PrivacyPage />} />
         <Route path="/qr" element={<QRPage />} />
         <Route path="/not-supported" element={<NotSupportedPage />} />
+        <Route path="/camera-test" element={<CameraTestPage />} />
       </Routes>
     </BrowserRouter>
   );
